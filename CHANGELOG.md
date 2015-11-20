@@ -13,16 +13,25 @@ All notable changes to the Pony compiler and standard library will be documented
 - Put unbox constructors on machine words into the vtable.
 - @jonas-l: parse URL with omitted password.
 - Adjust for ephemerality in cap_single().
+- Finalisation always occurs.
+- Type checking platform dependent FFI declarations on all platforms.
 
 ### Added
 
+- Embedded fields.
+- C-style structs.
+- Maybe[A] to encode C-style structs that aren't present.
 - OpenFile and CreateFile primitives to return well-typed errors.
 - @fowles: String.join
 - Array slice, permute, reverse.
 - Pooltrack and telemetry runtime builds.
+- ifdef expressions for platform dependent code.
+- User specified build flags.
 
 ### Changed
 
+- Interfaces are invariant if they are structurally equivalent.
+- Improved type checking with configuration management.
 - Improved realloc behaviour after heap_alloc_large.
 - Set-based upper bounds for generic constraints.
 - Moved the position of a default capability in a type specification.

@@ -1,5 +1,6 @@
 #include "sugar.h"
 #include "../ast/astbuild.h"
+#include "../pkg/ifdef.h"
 #include "../pkg/package.h"
 #include "../type/alias.h"
 #include "../type/assemble.h"
@@ -241,6 +242,76 @@ static ast_result_t sugar_member(ast_t* ast, bool add_create, bool add_eq,
   if(add_eq)
     add_comparable(id, typeparams, members);
 
+  // Build a reverse sequence of all field initialisers.
+  BUILD(init_seq, members, NODE(TK_SEQ));
+  ast_t* member = ast_child(members);
+
+  while(member != NULL)
+  {
+    switch(ast_id(member))
+    {
+      case TK_FLET:
+      case TK_FVAR:
+      case TK_EMBED:
+      {
+        AST_GET_CHILDREN(member, f_id, f_type, f_init);
+
+        if(ast_id(f_init) != TK_NONE)
+        {
+          // Replace the initialiser with TK_NONE.
+          ast_swap(f_init, ast_from(f_init, TK_NONE));
+
+          // id = init
+          BUILD(init, member,
+            NODE(TK_ASSIGN,
+            TREE(f_init)
+            NODE(TK_REFERENCE, TREE(f_id))));
+
+          ast_add(init_seq, init);
+        }
+        break;
+      }
+
+      default: {}
+    }
+
+    member = ast_sibling(member);
+  }
+
+  // Add field initialisers to all constructors.
+  if(ast_child(init_seq) != NULL)
+  {
+    member = ast_child(members);
+
+    while(member != NULL)
+    {
+      switch(ast_id(member))
+      {
+        case TK_NEW:
+        {
+          AST_GET_CHILDREN(member, n_cap, n_id, n_typeparam, n_params,
+            n_result, n_partial, n_body);
+
+          assert(ast_id(n_body) == TK_SEQ);
+
+          ast_t* init = ast_child(init_seq);
+
+          while(init != NULL)
+          {
+            ast_add(n_body, init);
+            init = ast_sibling(init);
+          }
+          break;
+        }
+
+        default: {}
+      }
+
+      member = ast_sibling(member);
+    }
+  }
+
+  ast_free_unattached(init_seq);
   return AST_OK;
 }
 
@@ -380,10 +451,18 @@ static void expand_none(ast_t* ast)
 }
 
 
-static ast_result_t sugar_return(ast_t* ast)
+static ast_result_t sugar_return(typecheck_t* t, ast_t* ast)
 {
   ast_t* return_value = ast_child(ast);
-  expand_none(return_value);
+
+  if((ast_id(ast) == TK_RETURN) && (ast_id(t->frame->method) == TK_NEW))
+  {
+    assert(ast_id(return_value) == TK_NONE);
+    ast_setid(return_value, TK_THIS);
+  } else {
+    expand_none(return_value);
+  }
+
   return AST_OK;
 }
 
@@ -956,6 +1035,73 @@ static ast_result_t sugar_ffi(ast_t* ast)
 }
 
 
+static ast_result_t sugar_ifdef(typecheck_t* t, ast_t* ast)
+{
+  assert(t != NULL);
+  assert(ast != NULL);
+
+  AST_GET_CHILDREN(ast, cond, then_block, else_block, else_cond);
+
+  // Combine parent ifdef condition with ours.
+  ast_t* parent_ifdef_cond = t->frame->ifdef_cond;
+
+  if(parent_ifdef_cond != NULL)
+  {
+    // We have a parent ifdef, combine its condition with ours.
+    assert(ast_id(ast_parent(parent_ifdef_cond)) == TK_IFDEF);
+
+    REPLACE(&else_cond,
+      NODE(TK_AND,
+        TREE(parent_ifdef_cond)
+        NODE(TK_NOT, TREE(cond))));
+
+    REPLACE(&cond,
+      NODE(TK_AND,
+        TREE(parent_ifdef_cond)
+        TREE(cond)));
+  }
+  else
+  {
+    // Make else condition for our children to use.
+    REPLACE(&else_cond, NODE(TK_NOT, TREE(cond)));
+  }
+
+  // Normalise condition so and, or and not nodes aren't sugared to function
+  // calls.
+  if(!ifdef_cond_normalise(&cond))
+  {
+    ast_error(ast, "ifdef condition will never be true");
+    return AST_ERROR;
+  }
+
+  if(!ifdef_cond_normalise(&else_cond))
+  {
+    ast_error(ast, "ifdef condition is always true");
+    return AST_ERROR;
+  }
+
+  return sugar_else(ast);
+}
+
+
+static ast_result_t sugar_use(ast_t* ast)
+{
+  assert(ast != NULL);
+
+  // Normalise condition so and, or and not nodes aren't sugared to function
+  // calls.
+  ast_t* guard = ast_childidx(ast, 2);
+
+  if(!ifdef_cond_normalise(&guard))
+  {
+    ast_error(ast, "use guard condition will never be true");
+    return AST_ERROR;
+  }
+
+  return AST_OK;
+}
+
+
 static ast_result_t sugar_semi(pass_opt_t* options, ast_t** astp)
 {
   ast_t* ast = *astp;
@@ -997,6 +1143,7 @@ ast_result_t pass_sugar(ast_t** astp, pass_opt_t* options)
   {
     case TK_MODULE:     return sugar_module(ast);
     case TK_PRIMITIVE:  return sugar_member(ast, true, true, TK_VAL);
+    case TK_STRUCT:     return sugar_member(ast, true, false, TK_REF);
     case TK_CLASS:      return sugar_member(ast, true, false, TK_REF);
     case TK_ACTOR:      return sugar_member(ast, true, false, TK_TAG);
     case TK_TRAIT:
@@ -1006,7 +1153,7 @@ ast_result_t pass_sugar(ast_t** astp, pass_opt_t* options)
     case TK_BE:         return sugar_be(t, ast);
     case TK_FUN:        return sugar_fun(ast);
     case TK_RETURN:
-    case TK_BREAK:      return sugar_return(ast);
+    case TK_BREAK:      return sugar_return(t, ast);
     case TK_IF:
     case TK_MATCH:
     case TK_WHILE:
@@ -1038,6 +1185,8 @@ ast_result_t pass_sugar(ast_t** astp, pass_opt_t* options)
     case TK_NOT:        return sugar_unop(astp, "op_not");
     case TK_FFIDECL:
     case TK_FFICALL:    return sugar_ffi(ast);
+    case TK_IFDEF:      return sugar_ifdef(t, ast);
+    case TK_USE:        return sugar_use(ast);
     case TK_SEMI:       return sugar_semi(options, astp);
     case TK_LET:        return sugar_let(t, ast);
     default:            return AST_OK;

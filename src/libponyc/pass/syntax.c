@@ -1,25 +1,30 @@
 #include "syntax.h"
 #include "../ast/id.h"
 #include "../ast/parser.h"
+#include "../ast/stringtab.h"
 #include "../ast/token.h"
 #include "../pkg/package.h"
+#include "../pkg/platformfuns.h"
 #include "../type/assemble.h"
-#include "../ast/stringtab.h"
+#include "../../libponyrt/mem/pool.h"
 #include <assert.h>
+#include <string.h>
+#include <ctype.h>
 
 
-#define DEF_CLASS 0
-#define DEF_ACTOR 1
-#define DEF_PRIMITIVE 2
-#define DEF_TRAIT 3
-#define DEF_INTERFACE 4
-#define DEF_TYPEALIAS 5
-#define DEF_ENTITY_COUNT 6
+#define DEF_ACTOR 0
+#define DEF_CLASS 1
+#define DEF_STRUCT 2
+#define DEF_PRIMITIVE 3
+#define DEF_TRAIT 4
+#define DEF_INTERFACE 5
+#define DEF_TYPEALIAS 6
+#define DEF_ENTITY_COUNT 7
 
-#define DEF_FUN 0
-#define DEF_BE 6
-#define DEF_NEW 12
-#define DEF_METHOD_COUNT 18
+#define DEF_FUN (DEF_ENTITY_COUNT * 0)
+#define DEF_BE (DEF_ENTITY_COUNT * 1)
+#define DEF_NEW (DEF_ENTITY_COUNT * 2)
+#define DEF_METHOD_COUNT (DEF_ENTITY_COUNT * 3)
 
 
 typedef struct permission_def_t
@@ -47,8 +52,9 @@ static const permission_def_t _entity_def[DEF_ENTITY_COUNT] =
   //                           | field
   //                           | | cap
   //                           | | | c_api
-  { "class",                  "N X X N" },
   { "actor",                  "X X N X" },
+  { "class",                  "N X X N" },
+  { "struct",                 "N X X N" },
   { "primitive",              "N N N N" },
   { "trait",                  "N N X N" },
   { "interface",              "N N X N" },
@@ -66,20 +72,23 @@ static const permission_def_t _method_def[DEF_METHOD_COUNT] =
   //                           | return
   //                           | | error
   //                           | | | body
-  { "class function",         "X X X Y" },
   { "actor function",         "X X X Y" },
+  { "class function",         "X X X Y" },
+  { "struct function",        "X X X Y" },
   { "primitive function",     "X X X Y" },
   { "trait function",         "X X X X" },
   { "interface function",     "X X X X" },
   { "type alias function",    NULL },
-  { "class behaviour",        NULL },
   { "actor behaviour",        "N N N Y" },
+  { "class behaviour",        NULL },
+  { "struct behaviour",       NULL },
   { "primitive behaviour",    NULL },
   { "trait behaviour",        "N N N X" },
   { "interface behaviour",    "N N N X" },
   { "type alias behaviour",   NULL },
-  { "class constructor",      "X N X Y" },
   { "actor constructor",      "N N N Y" },
+  { "class constructor",      "X N X Y" },
+  { "struct constructor",     "X N X Y" },
   { "primitive constructor",  "N N X Y" },
   { "trait constructor",      "X N X N" },
   { "interface constructor",  "X N X N" },
@@ -120,9 +129,10 @@ static bool is_expr_infix(token_id id)
 
 
 // Check whether the given node is a valid provides type
-static bool check_provides_type(ast_t* type)
+static bool check_provides_type(ast_t* type, const char* description)
 {
   assert(type != NULL);
+  assert(description != NULL);
 
   switch(ast_id(type))
   {
@@ -150,15 +160,15 @@ static bool check_provides_type(ast_t* type)
       // Check all our children are also legal
       for(ast_t* p = ast_child(type); p != NULL; p = ast_sibling(p))
       {
-        if(!check_provides_type(p))
+        if(!check_provides_type(p, description))
           return false;
       }
 
       return true;
 
     default:
-      ast_error(type, "invalid provides type. Can only provide "
-        "interfaces, traits and intersects of those.");
+      ast_error(type, "invalid %s type. Can only be "
+        "interfaces, traits and intersects of those.", description);
       return false;
   }
 }
@@ -256,6 +266,7 @@ static bool check_members(ast_t* members, int entity_def_index)
       case TK_FLET:
       case TK_FVAR:
       case TK_EMBED:
+      {
         if(def->permissions[ENTITY_FIELD] == 'N')
         {
           ast_error(member, "Can't have fields in %s", def->desc);
@@ -264,7 +275,13 @@ static bool check_members(ast_t* members, int entity_def_index)
 
         if(!check_id_field(ast_child(member)))
           r = false;
+
+        ast_t* delegate_type = ast_childidx(member, 3);
+        if(ast_id(delegate_type) != TK_NONE &&
+          !check_provides_type(delegate_type, "delegate"))
+          r = false;
         break;
+      }
 
       case TK_NEW:
         if(!check_method(member, entity_def_index + DEF_NEW))
@@ -336,7 +353,8 @@ static ast_result_t syntax_entity(ast_t* ast, int entity_def_index)
   if(entity_def_index != DEF_TYPEALIAS)
   {
     // Check referenced traits
-    if(ast_id(provides) != TK_NONE && !check_provides_type(provides))
+    if(ast_id(provides) != TK_NONE &&
+      !check_provides_type(provides, "provides"))
       r = AST_ERROR;
   }
   else
@@ -541,24 +559,45 @@ static ast_result_t syntax_consume(ast_t* ast)
 }
 
 
-static ast_result_t syntax_return(ast_t* ast, size_t max_value_count)
+static ast_result_t syntax_return(pass_opt_t* options, ast_t* ast,
+  size_t max_value_count)
 {
   assert(ast != NULL);
 
   ast_t* value_seq = ast_child(ast);
-
-  size_t value_count = 0;
-
-  if(value_seq != NULL)
-  {
-    assert(ast_id(value_seq) == TK_SEQ || ast_id(value_seq) == TK_NONE);
-    value_count = ast_childcount(value_seq);
-  }
+  assert(ast_id(value_seq) == TK_SEQ || ast_id(value_seq) == TK_NONE);
+  size_t value_count = ast_childcount(value_seq);
 
   if(value_count > max_value_count)
   {
     ast_error(ast_childidx(value_seq, max_value_count), "Unreachable code");
     return AST_ERROR;
+  }
+
+  if(ast_id(ast) == TK_RETURN)
+  {
+    if(options->check.frame->method_body == NULL)
+    {
+      ast_error(ast, "return must occur in a method body");
+      return AST_ERROR;
+    }
+
+    if(value_count > 0)
+    {
+      if(ast_id(options->check.frame->method) == TK_NEW)
+      {
+        ast_error(ast,
+          "A return in a constructor must not have an expression");
+        return AST_ERROR;
+      }
+
+      if(ast_id(options->check.frame->method) == TK_BE)
+      {
+        ast_error(ast,
+          "A return in a behaviour must not have an expression");
+        return AST_ERROR;
+      }
+    }
   }
 
   return AST_OK;
@@ -620,11 +659,122 @@ static ast_result_t syntax_type_param(ast_t* ast)
 }
 
 
+static const char* _illegal_flags[] =
+{
+  "ndebug",
+  "unknown_os",
+  "unknown_size",
+  NULL  // Terminator.
+};
+
+
+// Check the given ast is a valid ifdef condition.
+// The context parameter is for error messages and should be a literal string
+// such as "ifdef condition" or "use guard".
+static bool syntax_ifdef_cond(ast_t* ast, const char* context)
+{
+  assert(ast != NULL);
+  assert(context != NULL);
+
+  switch(ast_id(ast))
+  {
+    case TK_AND:
+    case TK_OR:
+    case TK_NOT:
+      // Valid node.
+      break;
+
+    case TK_STRING:
+    {
+      // Check user flag is not also a platform, or outlawed, flags
+      const char* name = ast_name(ast);
+
+      // Create an all lower case version of the name for comparisons.
+      size_t len = strlen(name) + 1;
+      char* lower_case = (char*)pool_alloc_size(len);
+
+      for(size_t i = 0; i < len; i++)
+        lower_case[i] = (char)tolower(name[i]);
+
+      bool r = true;
+      bool result;
+      if(os_is_target(lower_case, true, &result))
+        r = false;
+
+      for(int i = 0; _illegal_flags[i] != NULL; i++)
+        if(strcmp(lower_case, _illegal_flags[i]) == 0)
+          r = false;
+
+      pool_free_size(len, lower_case);
+
+      if(!r)
+      {
+        ast_error(ast, "\"%s\" is not a valid user build flag\n", name);
+        return false;
+      }
+
+      // TODO: restrict case?
+      break;
+    }
+
+    case TK_REFERENCE:
+    {
+      const char* name = ast_name(ast_child(ast));
+      bool result;
+      if(!os_is_target(name, true, &result))
+      {
+        ast_error(ast, "\"%s\" is not a valid platform flag\n", name);
+        return false;
+      }
+
+      // Don't recurse into children, that'll hit the ID node
+      return true;
+    }
+
+    case TK_SEQ:
+      if(ast_childcount(ast) != 1)
+      {
+        ast_error(ast, "Sequence not allowed in %s", context);
+        return false;
+      }
+
+      break;
+
+    default:
+      ast_error(ast, "Invalid %s", context);
+      return false;
+  }
+
+  for(ast_t* p = ast_child(ast); p != NULL; p = ast_sibling(p))
+  {
+    if(!syntax_ifdef_cond(p, context))
+      return false;
+  }
+
+  return true;
+}
+
+
+static ast_result_t syntax_ifdef(ast_t* ast)
+{
+  assert(ast != NULL);
+
+  if(!syntax_ifdef_cond(ast_child(ast), "ifdef condition"))
+    return AST_ERROR;
+
+  return AST_OK;
+}
+
+
 static ast_result_t syntax_use(ast_t* ast)
 {
-  ast_t* id = ast_child(ast);
+  assert(ast != NULL);
+  AST_GET_CHILDREN(ast, id, url, guard);
 
   if(ast_id(id) != TK_NONE && !check_id_package(id))
+    return AST_ERROR;
+
+  if(ast_id(guard) != TK_NONE && !syntax_ifdef_cond(guard, "use guard"))
     return AST_ERROR;
 
   return AST_OK;
@@ -639,6 +789,82 @@ static ast_result_t syntax_lambda_capture(ast_t* ast)
   {
     ast_error(ast, "value missing for lambda expression capture (cannot "
       "specify type without value)");
+    return AST_ERROR;
+  }
+
+  return AST_OK;
+}
+
+
+static ast_result_t syntax_compile_intrinsic(ast_t* ast)
+{
+  ast_t* parent = ast_parent(ast);
+  assert(ast_id(parent) == TK_SEQ);
+
+  ast_t* method = ast_parent(parent);
+
+  switch(ast_id(method))
+  {
+    case TK_NEW:
+    case TK_BE:
+    case TK_FUN:
+      // OK
+      break;
+
+    default:
+      ast_error(ast, "a compile intrinsic must be a method body");
+      return AST_ERROR;
+  }
+
+  ast_t* child = ast_child(parent);
+
+  // Allow a docstring before the compile_instrinsic.
+  if(ast_id(child) == TK_STRING)
+    child = ast_sibling(child);
+
+  // Compile intrinsic has a value child, but it must be empty
+  ast_t* value = ast_child(ast);
+
+  if(child != ast || ast_sibling(child) != NULL || ast_id(value) != TK_NONE)
+  {
+    ast_error(ast, "a compile intrinsic must be the entire body");
+    return AST_ERROR;
+  }
+
+  return AST_OK;
+}
+
+
+static ast_result_t syntax_compile_error(ast_t* ast)
+{
+  ast_t* parent = ast_parent(ast);
+  assert(ast_id(parent) == TK_SEQ);
+
+  if(ast_id(ast_parent(parent)) != TK_IFDEF)
+  {
+    ast_error(ast, "a compile error must be in an ifdef");
+    return AST_ERROR;
+  }
+
+  // AST must be of the form:
+  // (compile_error (seq "Reason"))
+  ast_t* reason_seq = ast_child(ast);
+
+  if(ast_id(reason_seq) != TK_SEQ ||
+    ast_id(ast_child(reason_seq)) != TK_STRING)
+  {
+    ast_print(ast);
+    ast_error(ast,
+      "a compile error must have a string literal reason for the error");
+    return AST_ERROR;
+  }
+
+  ast_t* child = ast_child(parent);
+
+  if((child != ast) || (ast_sibling(child) != NULL) ||
+    (ast_childcount(reason_seq) != 1))
+  {
+    ast_error(ast, "a compile error must be the entire ifdef clause");
     return AST_ERROR;
   }
 
@@ -674,6 +900,7 @@ ast_result_t pass_syntax(ast_t** astp, pass_opt_t* options)
     case TK_SEMI:       r = syntax_semi(ast); break;
     case TK_TYPE:       r = syntax_entity(ast, DEF_TYPEALIAS); break;
     case TK_PRIMITIVE:  r = syntax_entity(ast, DEF_PRIMITIVE); break;
+    case TK_STRUCT:     r = syntax_entity(ast, DEF_STRUCT); break;
     case TK_CLASS:      r = syntax_entity(ast, DEF_CLASS); break;
     case TK_ACTOR:      r = syntax_entity(ast, DEF_ACTOR); break;
     case TK_TRAIT:      r = syntax_entity(ast, DEF_TRAIT); break;
@@ -686,17 +913,22 @@ ast_result_t pass_syntax(ast_t** astp, pass_opt_t* options)
     case TK_ELLIPSIS:   r = syntax_ellipsis(ast); break;
     case TK_CONSUME:    r = syntax_consume(ast); break;
     case TK_RETURN:
-    case TK_BREAK:      r = syntax_return(ast, 1); break;
+    case TK_BREAK:      r = syntax_return(options, ast, 1); break;
     case TK_CONTINUE:
-    case TK_ERROR:      r = syntax_return(ast, 0); break;
+    case TK_ERROR:      r = syntax_return(options, ast, 0); break;
     case TK_LET:
     case TK_VAR:        r = syntax_local(ast); break;
     case TK_EMBED:      r = syntax_embed(ast); break;
     case TK_PARAM:      r = syntax_param(ast); break;
     case TK_TYPEPARAM:  r = syntax_type_param(ast); break;
+    case TK_IFDEF:      r = syntax_ifdef(ast); break;
     case TK_USE:        r = syntax_use(ast); break;
     case TK_LAMBDACAPTURE:
                         r = syntax_lambda_capture(ast); break;
+    case TK_COMPILE_INTRINSIC:
+                        r = syntax_compile_intrinsic(ast); break;
+    case TK_COMPILE_ERROR:
+                        r = syntax_compile_error(ast); break;
     default: break;
   }
 

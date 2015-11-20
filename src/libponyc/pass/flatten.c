@@ -2,6 +2,7 @@
 #include "../type/alias.h"
 #include "../type/assemble.h"
 #include "../type/cap.h"
+#include "../type/subtype.h"
 #include <assert.h>
 
 ast_result_t flatten_typeparamref(ast_t* ast)
@@ -202,11 +203,26 @@ ast_result_t pass_flatten(ast_t** astp, pass_opt_t* options)
 
     case TK_FVAR:
     case TK_FLET:
-    case TK_EMBED:
       return flatten_provides_list(ast, 3);
+
+    case TK_EMBED:
+    {
+      AST_GET_CHILDREN(ast, id, type, init);
+
+      // An embedded field must have a known, class type.
+      if(!is_known(type) ||
+        (!is_entity(type, TK_STRUCT) && !is_entity(type, TK_CLASS)))
+      {
+        ast_error(ast, "embedded fields must be classes or structs");
+        return AST_ERROR;
+      }
+
+      return flatten_provides_list(ast, 3);
+    }
 
     case TK_ACTOR:
     case TK_CLASS:
+    case TK_STRUCT:
     case TK_PRIMITIVE:
     case TK_TRAIT:
     case TK_INTERFACE:

@@ -156,9 +156,9 @@ static bool special_case_call(compile_t* c, ast_t* ast, LLVMValueRef* value)
 
   if((name == c->str_I128) || (name == c->str_U128))
   {
-    bool has_i128;
-    os_is_target(OS_HAS_I128_NAME, c->opt->release, &has_i128);
-    return special_case_operator(c, ast, value, false, has_i128);
+    bool native128;
+    os_is_target(OS_NATIVE128_NAME, c->opt->release, &native128);
+    return special_case_operator(c, ast, value, false, native128);
   }
 
   if(name == c->str_Platform)
@@ -225,8 +225,8 @@ static bool call_needs_receiver(ast_t* postfix, gentype_t* g)
   if(g->primitive != NULL)
     return false;
 
-  // No receiver if a new Pointer.
-  if(is_pointer(g->ast))
+  // No receiver if a new Pointer or Maybe.
+  if(is_pointer(g->ast) || is_maybe(g->ast))
     return false;
 
   return true;
@@ -341,8 +341,18 @@ LLVMValueRef gen_call(compile_t* c, ast_t* ast)
     {
       case TK_NEWREF:
       case TK_NEWBEREF:
-        args[0] = gencall_alloc(c, &g);
+      {
+        ast_t* parent = ast_parent(ast);
+        ast_t* sibling = ast_sibling(ast);
+
+        // If we're constructing an embed field, pass a pointer to the field
+        // as the receiver. Otherwise, allocate an object.
+        if((ast_id(parent) == TK_ASSIGN) && (ast_id(sibling) == TK_EMBEDREF))
+          args[0] = gen_fieldptr(c, sibling);
+        else
+          args[0] = gencall_alloc(c, &g);
         break;
+      }
 
       case TK_BEREF:
       case TK_FUNREF:
@@ -593,8 +603,8 @@ LLVMValueRef gencall_alloc(compile_t* c, gentype_t* g)
   if(g->primitive != NULL)
     return NULL;
 
-  // Do nothing for Pointer.
-  if(is_pointer(g->ast))
+  // Do nothing for Pointer and Maybe.
+  if(is_pointer(g->ast) || is_maybe(g->ast))
     return NULL;
 
   // Use the global instance if we have one.
@@ -646,8 +656,11 @@ LLVMValueRef gencall_allocstruct(compile_t* c, gentype_t* g)
   result = LLVMBuildBitCast(c->builder, result, g->structure_ptr, "");
 
   // Set the descriptor.
-  LLVMValueRef desc_ptr = LLVMBuildStructGEP(c->builder, result, 0, "");
-  LLVMBuildStore(c->builder, g->desc, desc_ptr);
+  if(g->underlying != TK_STRUCT)
+  {
+    LLVMValueRef desc_ptr = LLVMBuildStructGEP(c->builder, result, 0, "");
+    LLVMBuildStore(c->builder, g->desc, desc_ptr);
+  }
 
   return result;
 }

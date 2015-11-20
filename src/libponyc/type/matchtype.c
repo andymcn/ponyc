@@ -264,7 +264,14 @@ static matchtype_t is_matchtype_operand_entity(ast_t* operand, ast_t* pattern)
       return is_matchtype_subtype_or_deny(operand, pattern);
 
     case TK_UNIONTYPE:
+    {
+      ast_t* def = (ast_t*)ast_data(operand);
+
+      if(ast_id(def) == TK_STRUCT)
+        return MATCHTYPE_DENY;
+
       return is_matchtype_pattern_union(operand, pattern);
+    }
 
     case TK_ISECTTYPE:
       return is_matchtype_pattern_isect(operand, pattern);
@@ -289,6 +296,7 @@ static matchtype_t is_matchtype_operand_nominal(ast_t* operand, ast_t* pattern)
   switch(ast_id(def))
   {
     case TK_PRIMITIVE:
+    case TK_STRUCT:
     case TK_CLASS:
     case TK_ACTOR:
       return is_matchtype_operand_entity(operand, pattern);

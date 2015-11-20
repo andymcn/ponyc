@@ -73,6 +73,31 @@ static bool is_eq_typeargs(ast_t* a, ast_t* b)
   return (a_arg == NULL) && (b_arg == NULL);
 }
 
+static bool is_nominal_eq_nominal(ast_t* sub, ast_t* super)
+{
+  ast_t* sub_cap = fetch_cap(sub);
+  ast_t* sub_eph = ast_sibling(sub_cap);
+  ast_t* super_cap = fetch_cap(super);
+  ast_t* super_eph = ast_sibling(super_cap);
+
+  token_id t_sub_cap = ast_id(sub_cap);
+  token_id t_sub_eph = ast_id(sub_eph);
+  token_id t_super_cap = ast_id(super_cap);
+  token_id t_super_eph = ast_id(super_eph);
+
+  if((t_sub_cap != t_super_cap) || (t_sub_eph != t_super_eph))
+    return false;
+
+  ast_t* sub_def = (ast_t*)ast_data(sub);
+  ast_t* super_def = (ast_t*)ast_data(super);
+
+  // If we are the same nominal type, our typeargs must be the same.
+  if(sub_def == super_def)
+    return is_eq_typeargs(sub, super);
+
+  return false;
+}
+
 static bool is_recursive_interface(ast_t* sub, ast_t* super, ast_t* isub,
   ast_t* isuper)
 {
@@ -86,7 +111,7 @@ static bool is_recursive_interface(ast_t* sub, ast_t* super, ast_t* isub,
   assert(ast_id(isuper) == TK_NOMINAL);
 
   return (ast_id(sub) == TK_NOMINAL) && (ast_id(super) == TK_NOMINAL) &&
-    is_eqtype(sub, isub) && is_eqtype(super, isuper);
+    is_nominal_eq_nominal(sub, isub) && is_nominal_eq_nominal(super, isuper);
 }
 
 static bool is_reified_fun_sub_fun(ast_t* sub, ast_t* super,
@@ -288,6 +313,10 @@ static bool is_nominal_sub_interface(ast_t* sub, ast_t* super)
   ast_t* sub_def = (ast_t*)ast_data(sub);
   ast_t* super_def = (ast_t*)ast_data(super);
 
+  // A struct has no descriptor, so can't be a subtype of an interface.
+  if(ast_id(sub_def) == TK_STRUCT)
+    return false;
+
   ast_t* sub_typeargs = ast_childidx(sub, 2);
   ast_t* super_typeargs = ast_childidx(super, 2);
 
@@ -336,6 +365,10 @@ static bool is_nominal_sub_interface(ast_t* sub, ast_t* super)
 static bool is_nominal_sub_trait(ast_t* sub, ast_t* super)
 {
   ast_t* sub_def = (ast_t*)ast_data(sub);
+
+  // A struct has no descriptor, so can't be a subtype of a trait.
+  if(ast_id(sub_def) == TK_STRUCT)
+    return false;
 
   // Get our typeparams and typeargs.
   ast_t* typeparams = ast_childidx(sub_def, 1);
@@ -387,6 +420,7 @@ static bool is_nominal_sub_nominal(ast_t* sub, ast_t* super)
   switch(ast_id(super_def))
   {
     case TK_PRIMITIVE:
+    case TK_STRUCT:
     case TK_CLASS:
     case TK_ACTOR:
       // If we are the same nominal type, our typeargs must be the same.
@@ -429,12 +463,13 @@ static bool is_nominal_sub_typeparam(ast_t* sub, ast_t* super)
     switch(ast_id(constraint_def))
     {
       case TK_PRIMITIVE:
+      case TK_STRUCT:
       case TK_CLASS:
       case TK_ACTOR:
       {
-        // Constraint must be modified with super ephemerality.
+        // Use the cap and ephemerality of the subtype.
         AST_GET_CHILDREN(super, name, cap, eph);
-        ast_t* r_constraint = set_cap_and_ephemeral(constraint, TK_NONE,
+        ast_t* r_constraint = set_cap_and_ephemeral(constraint, ast_id(cap),
           ast_id(eph));
 
         // Must be a subtype of the constraint.
@@ -607,51 +642,9 @@ static bool is_tuple_subtype(ast_t* sub, ast_t* super)
   return false;
 }
 
-// The subtype is a pointer, the supertype could be anything.
-static bool is_pointer_subtype(ast_t* sub, ast_t* super)
-{
-  switch(ast_id(super))
-  {
-    case TK_NOMINAL:
-    {
-      // Must be a Pointer, and the type argument must be the same.
-      return is_pointer(super) &&
-        is_eq_typeargs(sub, super) &&
-        is_sub_cap_and_ephemeral(sub, super);
-    }
-
-    case TK_TYPEPARAMREF:
-    {
-      // We must be a subtype of the constraint.
-      ast_t* def = (ast_t*)ast_data(super);
-      ast_t* constraint = ast_childidx(def, 1);
-
-      return is_pointer_subtype(sub, constraint);
-    }
-
-    case TK_ARROW:
-    {
-      // We must be a subtype of the lower bounds.
-      ast_t* lower = viewpoint_lower(super);
-      bool ok = is_pointer_subtype(sub, lower);
-      ast_free_unattached(lower);
-      return ok;
-    }
-
-    default: {}
-  }
-
-  return false;
-}
-
 // The subtype is a nominal, the supertype could be anything.
 static bool is_nominal_subtype(ast_t* sub, ast_t* super)
 {
-  // Special case Pointer[A]. It can only be a subtype of itself, because
-  // in the code generator, a pointer has no vtable.
-  if(is_pointer(sub))
-    return is_pointer_subtype(sub, super);
-
   switch(ast_id(super))
   {
     case TK_NOMINAL:
@@ -661,7 +654,15 @@ static bool is_nominal_subtype(ast_t* sub, ast_t* super)
       return is_nominal_sub_typeparam(sub, super);
 
     case TK_UNIONTYPE:
+    {
+      ast_t* def = (ast_t*)ast_data(sub);
+
+      // A struct has no descriptor, so can't be a subtype of a union.
+      if(ast_id(def) == TK_STRUCT)
+        return false;
+
       return is_subtype_union(sub, super);
+    }
 
     case TK_ISECTTYPE:
       return is_subtype_isect(sub, super);
@@ -729,9 +730,9 @@ static bool is_typeparam_subtype(ast_t* sub, ast_t* super)
       return false;
   }
 
-  // Constraint must be modified with sub ephemerality.
+  // Use the cap and ephemerality of the subtype.
   AST_GET_CHILDREN(sub, name, cap, eph);
-  ast_t* r_constraint = set_cap_and_ephemeral(constraint, TK_NONE,
+  ast_t* r_constraint = set_cap_and_ephemeral(constraint, ast_id(cap),
     ast_id(eph));
 
   bool ok = is_subtype(r_constraint, super);
@@ -882,42 +883,19 @@ bool is_subtype(ast_t* sub, ast_t* super)
   return false;
 }
 
-static bool is_nominal_eq_nominal(ast_t* sub, ast_t* super)
-{
-  ast_t* sub_cap = fetch_cap(sub);
-  ast_t* sub_eph = ast_sibling(sub_cap);
-  ast_t* super_cap = fetch_cap(super);
-  ast_t* super_eph = ast_sibling(super_cap);
-
-  token_id t_sub_cap = ast_id(sub_cap);
-  token_id t_sub_eph = ast_id(sub_eph);
-  token_id t_super_cap = ast_id(super_cap);
-  token_id t_super_eph = ast_id(super_eph);
-
-  if((t_sub_cap != t_super_cap) || (t_sub_eph != t_super_eph))
-    return false;
-
-  ast_t* sub_def = (ast_t*)ast_data(sub);
-  ast_t* super_def = (ast_t*)ast_data(super);
-
-  // If we are the same nominal type, our typeargs must be the same.
-  if(sub_def == super_def)
-    return is_eq_typeargs(sub, super);
-
-  return false;
-}
-
 bool is_eqtype(ast_t* a, ast_t* b)
 {
-  if((ast_id(a) == TK_NOMINAL) && (ast_id(b) == TK_NOMINAL))
-    return is_nominal_eq_nominal(a, b);
-
   return is_subtype(a, b) && is_subtype(b, a);
 }
 
 bool is_pointer(ast_t* type)
 {
   return is_literal(type, "Pointer");
+}
+
+bool is_maybe(ast_t* type)
+{
+  return is_literal(type, "Maybe");
 }
 
 bool is_none(ast_t* type)
@@ -987,11 +965,6 @@ bool is_signed(pass_opt_t* opt, ast_t* type)
   return ok;
 }
 
-bool is_composite(ast_t* type)
-{
-  return !is_machine_word(type) && !is_pointer(type);
-}
-
 bool is_constructable(ast_t* type)
 {
   switch(ast_id(type))
@@ -1039,6 +1012,7 @@ bool is_constructable(ast_t* type)
         }
 
         case TK_PRIMITIVE:
+        case TK_STRUCT:
         case TK_CLASS:
         case TK_ACTOR:
           return true;
@@ -1104,6 +1078,7 @@ bool is_concrete(ast_t* type)
           return false;
 
         case TK_PRIMITIVE:
+        case TK_STRUCT:
         case TK_CLASS:
         case TK_ACTOR:
           return true;
@@ -1165,6 +1140,7 @@ bool is_known(ast_t* type)
           return false;
 
         case TK_PRIMITIVE:
+        case TK_STRUCT:
         case TK_CLASS:
         case TK_ACTOR:
           return true;
@@ -1192,7 +1168,7 @@ bool is_known(ast_t* type)
   return false;
 }
 
-bool is_actor(ast_t* type)
+bool is_entity(ast_t* type, token_id entity)
 {
   switch(ast_id(type))
   {
@@ -1205,7 +1181,7 @@ bool is_actor(ast_t* type)
 
       while(child != NULL)
       {
-        if(!is_actor(child))
+        if(!is_entity(child, entity))
           return false;
 
         child = ast_sibling(child);
@@ -1220,7 +1196,7 @@ bool is_actor(ast_t* type)
 
       while(child != NULL)
       {
-        if(is_actor(child))
+        if(is_entity(child, entity))
           return true;
 
         child = ast_sibling(child);
@@ -1232,32 +1208,18 @@ bool is_actor(ast_t* type)
     case TK_NOMINAL:
     {
       ast_t* def = (ast_t*)ast_data(type);
-
-      switch(ast_id(def))
-      {
-        case TK_INTERFACE:
-        case TK_TRAIT:
-        case TK_PRIMITIVE:
-        case TK_CLASS:
-          return false;
-
-        case TK_ACTOR:
-          return true;
-
-        default: {}
-      }
-      break;
+      return ast_id(def) == entity;
     }
 
     case TK_ARROW:
-      return is_actor(ast_childidx(type, 1));
+      return is_entity(ast_childidx(type, 1), entity);
 
     case TK_TYPEPARAMREF:
     {
       ast_t* def = (ast_t*)ast_data(type);
       ast_t* constraint = ast_childidx(def, 1);
 
-      return is_actor(constraint);
+      return is_entity(constraint, entity);
     }
 
     default: {}

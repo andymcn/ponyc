@@ -26,7 +26,7 @@ static void setup_dwarf(dwarf_t* dwarf, dwarf_meta_t* meta, gentype_t* g,
     else if(is_bool(ast))
       meta->flags |= DWARF_BOOLEAN;
   }
-  else if(is_pointer(ast) || !is_concrete(ast) ||
+  else if(is_pointer(ast) || is_maybe(ast) || !is_concrete(ast) ||
     (is_constructable(ast) && field))
   {
     type = g->use_type;
@@ -179,7 +179,9 @@ void dwarf_field(dwarf_t* dwarf, gentype_t* composite, gentype_t* field,
   if(composite->underlying != TK_TUPLETYPE)
   {
     structure = composite->structure;
-    offset++;
+
+    if(composite->underlying != TK_STRUCT)
+      offset++;
 
     if(composite->underlying == TK_ACTOR)
       offset++;

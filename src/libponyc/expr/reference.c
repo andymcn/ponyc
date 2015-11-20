@@ -130,18 +130,12 @@ bool expr_field(pass_opt_t* opt, ast_t* ast)
 {
   AST_GET_CHILDREN(ast, id, type, init);
 
-  // An embedded field must have a known, non-actor type.
-  if(ast_id(ast) == TK_EMBED)
-  {
-    if(!is_known(type) || is_actor(type))
-    {
-      ast_error(ast, "embedded fields must always be primitives or classes");
-      return false;
-    }
-  }
-
   if(ast_id(init) != TK_NONE)
   {
+    // Only parameters have initialisers. Field initialisers are moved into
+    // constructors in the sugar pass.
+    assert(ast_id(ast) == TK_PARAM);
+
     // Initialiser type must match declared type.
     if(!coerce_literals(&init, type, opt))
       return false;
@@ -156,23 +150,11 @@ bool expr_field(pass_opt_t* opt, ast_t* ast)
     if(!is_subtype(init_type, type))
     {
       ast_error(init,
-        "field/param initialiser is not a subtype of the field/param type");
-      ast_error(type, "field/param type: %s", ast_print_type(type));
-      ast_error(init, "initialiser type: %s", ast_print_type(init_type));
+        "default argument is not a subtype of the parameter type");
+      ast_error(type, "parameter type: %s", ast_print_type(type));
+      ast_error(init, "default argument type: %s", ast_print_type(init_type));
       ast_free_unattached(init_type);
       return false;
-    }
-
-    // If it's an embedded field, check for a constructor result.
-    if(ast_id(ast) == TK_EMBED)
-    {
-      if((ast_id(init) != TK_CALL) ||
-        (ast_id(ast_childidx(init, 2)) != TK_NEWREF))
-      {
-        ast_error(ast,
-          "an embedded field must be initialised using a constructor");
-        return false;
-      }
     }
 
     ast_free_unattached(init_type);
@@ -451,6 +433,7 @@ bool expr_reference(pass_opt_t* opt, ast_t** astp)
     case TK_TYPE:
     case TK_TYPEPARAM:
     case TK_PRIMITIVE:
+    case TK_STRUCT:
     case TK_CLASS:
     case TK_ACTOR:
     {
@@ -730,10 +713,11 @@ bool expr_identityof(pass_opt_t* opt, ast_t* ast)
     case TK_VARREF:
     case TK_LETREF:
     case TK_PARAMREF:
+    case TK_THIS:
       break;
 
     default:
-      ast_error(ast, "identity must be for a field, local or parameter");
+      ast_error(ast, "identity must be for a field, local, parameter or this");
       return false;
   }
 
@@ -1029,7 +1013,7 @@ static bool check_return_type(ast_t* ast)
     return true;
 
   // If it's a compiler intrinsic, ignore it.
-  if(ast_id(body_type) == TK_COMPILER_INTRINSIC)
+  if(ast_id(body_type) == TK_COMPILE_INTRINSIC)
     return true;
 
   // The body type must match the return type, without subsumption, or an alias
@@ -1235,7 +1219,18 @@ bool expr_fun(pass_opt_t* opt, ast_t* ast)
   if(ast_id(can_error) == TK_QUESTION)
   {
     // If a partial function, check that we might actually error.
-    if(!is_trait && !ast_canerror(body))
+    ast_t* body_type = ast_type(body);
+
+    if(body_type == NULL)
+    {
+      // An error has already occurred.
+      assert(get_error_count() > 0);
+      return false;
+    }
+
+    if(!is_trait &&
+      !ast_canerror(body) &&
+      (ast_id(body_type) != TK_COMPILE_INTRINSIC))
     {
       ast_error(can_error, "function body is not partial but the function is");
       return false;
@@ -1267,29 +1262,13 @@ bool expr_fun(pass_opt_t* opt, ast_t* ast)
   return true;
 }
 
-bool expr_compiler_intrinsic(typecheck_t* t, ast_t* ast)
+bool expr_compile_intrinsic(typecheck_t* t, ast_t* ast)
 {
-  if(t->frame->method_body == NULL)
-  {
-    ast_error(ast, "a compiler intrinsic must be a method body");
-    return false;
-  }
-
-  ast_t* child = ast_child(t->frame->method_body);
-
-  // Allow a docstring before the compiler_instrinsic.
-  if(ast_id(child) == TK_STRING)
-    child = ast_sibling(child);
-
-  if((child != ast) || (ast_sibling(child) != NULL))
-  {
-    ast_error(ast, "a compiler intrinsic must be the entire body");
-    return false;
-  }
+  assert(t->frame->method_body != NULL);
 
   // Disable debuglocs on calls to this method.
   ast_setdebug(t->frame->method, false);
 
-  ast_settype(ast, ast_from(ast, TK_COMPILER_INTRINSIC));
+  ast_settype(ast, ast_from(ast, TK_COMPILE_INTRINSIC));
   return true;
 }

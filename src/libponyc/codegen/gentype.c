@@ -41,6 +41,9 @@ static void make_box_type(compile_t* c, gentype_t* g)
 static void make_global_descriptor(compile_t* c, gentype_t* g)
 {
   // Fetch or create a descriptor type.
+  if(g->underlying == TK_STRUCT)
+    return;
+
   if(g->underlying == TK_TUPLETYPE)
     g->field_count = (int)ast_childcount(g->ast);
 
@@ -130,6 +133,8 @@ static bool setup_name(compile_t* c, ast_t* ast, gentype_t* g, bool prelim)
         g->primitive = c->f64;
       else if(name == c->str_Pointer)
         return genprim_pointer(c, g, prelim);
+      else if(name == c->str_Maybe)
+        return genprim_maybe(c, g, prelim);
       else if(name == c->str_Platform)
         return true;
     }
@@ -184,6 +189,7 @@ static void setup_tuple_fields(gentype_t* g)
 {
   g->field_count = (int)ast_childcount(g->ast);
   g->fields = (ast_t**)calloc(g->field_count, sizeof(ast_t*));
+  g->field_keys = NULL;
 
   ast_t* child = ast_child(g->ast);
   size_t index = 0;
@@ -201,6 +207,7 @@ static void setup_type_fields(gentype_t* g)
 
   g->field_count = 0;
   g->fields = NULL;
+  g->field_keys = NULL;
 
   ast_t* def = (ast_t*)ast_data(g->ast);
 
@@ -234,6 +241,7 @@ static void setup_type_fields(gentype_t* g)
     return;
 
   g->fields = (ast_t**)calloc(g->field_count, sizeof(ast_t*));
+  g->field_keys = (token_id*)calloc(g->field_count, sizeof(token_id));
 
   member = ast_child(members);
   size_t index = 0;
@@ -249,8 +257,10 @@ static void setup_type_fields(gentype_t* g)
         AST_GET_CHILDREN(member, name, type, init);
         g->fields[index] = reify(typeparams, ast_type(member), typeparams,
           typeargs);
+
         // TODO: Are we sure the AST source file is correct?
         ast_setpos(g->fields[index], NULL, ast_line(name), ast_pos(name));
+        g->field_keys[index] = ast_id(member);
         index++;
         break;
       }
@@ -268,9 +278,11 @@ static void free_fields(gentype_t* g)
     ast_free_unattached(g->fields[i]);
 
   free(g->fields);
+  free(g->field_keys);
 
   g->field_count = 0;
   g->fields = NULL;
+  g->field_keys = NULL;
 }
 
 static void make_dispatch(compile_t* c, gentype_t* g)
@@ -310,8 +322,27 @@ static bool trace_fields(compile_t* c, gentype_t* g, LLVMValueRef ctx,
   {
     LLVMValueRef field = LLVMBuildStructGEP(c->builder, object, i + extra,
       "");
-    LLVMValueRef value = LLVMBuildLoad(c->builder, field, "");
-    need_trace |= gentrace(c, ctx, value, g->fields[i]);
+
+    if(g->field_keys[i] != TK_EMBED)
+    {
+      // Call the trace function indirectly depending on rcaps.
+      LLVMValueRef value = LLVMBuildLoad(c->builder, field, "");
+      need_trace |= gentrace(c, ctx, value, g->fields[i]);
+    } else {
+      // Call the trace function directly without marking the field.
+      const char* fun = genname_trace(genname_type(g->fields[i]));
+      LLVMValueRef trace_fn = LLVMGetNamedFunction(c->module, fun);
+
+      if(trace_fn != NULL)
+      {
+        LLVMValueRef args[2];
+        args[0] = ctx;
+        args[1] = LLVMBuildBitCast(c->builder, field, c->object_ptr, "");
+
+        LLVMBuildCall(c->builder, trace_fn, args, 2, "");
+        need_trace = true;
+      }
+    }
   }
 
   return need_trace;
@@ -408,7 +439,11 @@ static bool make_trace(compile_t* c, gentype_t* g)
       LLVMDeleteFunction(trace_tuple_fn);
     }
   } else {
-    int extra = 1;
+    int extra = 0;
+
+    // Non-structs have a type descriptor.
+    if(g->underlying != TK_STRUCT)
+      extra++;
 
     // Actors have a pad.
     if(g->underlying == TK_ACTOR)
@@ -434,7 +469,9 @@ static bool make_struct(compile_t* c, gentype_t* g)
   if(g->underlying != TK_TUPLETYPE)
   {
     type = g->structure;
-    extra++;
+
+    if(g->underlying != TK_STRUCT)
+      extra++;
   } else {
     type = g->primitive;
   }
@@ -446,7 +483,7 @@ static bool make_struct(compile_t* c, gentype_t* g)
   LLVMTypeRef* elements = (LLVMTypeRef*)pool_alloc_size(buf_size);
 
   // Create the type descriptor as element 0.
-  if(g->underlying != TK_TUPLETYPE)
+  if(extra > 0)
     elements[0] = LLVMPointerType(g->desc_type, 0);
 
   // Create the actor pad as element 1.
@@ -459,14 +496,30 @@ static bool make_struct(compile_t* c, gentype_t* g)
   for(int i = 0; i < g->field_count; i++)
   {
     gentype_t field_g;
+    bool ok;
 
-    if(!gentype_prelim(c, g->fields[i], &field_g))
+    if((g->field_keys != NULL) && (g->field_keys[i] == TK_EMBED))
+    {
+      ok = gentype(c, g->fields[i], &field_g);
+      elements[i + extra] = field_g.structure;
+    } else {
+      ok = gentype_prelim(c, g->fields[i], &field_g);
+      elements[i + extra] = field_g.use_type;
+    }
+
+    if(!ok)
     {
       pool_free_size(buf_size, elements);
       return false;
     }
+  }
 
-    elements[i + extra] = field_g.use_type;
+  // An embedded field may have caused the current type to be fully generated
+  // at this point. If so, finish gracefully.
+  if(!LLVMIsOpaqueStruct(type))
+  {
+    g->done = true;
+    return true;
   }
 
   LLVMStructSetBody(type, elements, g->field_count + extra, false);
@@ -523,12 +576,15 @@ static bool make_nominal(compile_t* c, ast_t* ast, gentype_t* g, bool prelim)
     setup_type_fields(g);
 
     // Forward declare debug symbols for this nominal, if needed.
-    // At this point, this can only be TK_CLASS, TK_PRIMITIVE, or TK_ACTOR
-    // ast nodes. TK_TYPE has been translated to any of the former during
-    // reification.
+    // At this point, this can only be TK_STRUCT, TK_CLASS, TK_PRIMITIVE, or
+    // TK_ACTOR ast nodes. TK_TYPE has been translated to any of the former
+    // during reification.
     dwarf_forward(&c->dwarf, g);
 
-    bool ok = make_struct(c, g) && make_trace(c, g) && make_components(c, g);
+    bool ok = make_struct(c, g);
+
+    if(!g->done)
+      ok = ok && make_trace(c, g) && make_components(c, g);
 
     if(!ok)
     {
@@ -537,7 +593,8 @@ static bool make_nominal(compile_t* c, ast_t* ast, gentype_t* g, bool prelim)
     }
 
     // Finalise symbols for composite type.
-    dwarf_composite(&c->dwarf, g);
+    if(!g->done)
+      dwarf_composite(&c->dwarf, g);
   } else {
     // Emit debug symbols for a basic type (U8, U16, U32...)
     dwarf_basic(&c->dwarf, g);
@@ -546,32 +603,37 @@ static bool make_nominal(compile_t* c, ast_t* ast, gentype_t* g, bool prelim)
     make_box_type(c, g);
   }
 
-  // Generate a dispatch function if necessary.
-  make_dispatch(c, g);
-
-  // Create a unique global instance if we need one.
-  make_global_instance(c, g);
-
-  // Generate all the methods.
-  if(!genfun_methods(c, g))
+  if(!g->done)
   {
-    free_fields(g);
-    return false;
+    // Generate a dispatch function if necessary.
+    make_dispatch(c, g);
+
+    // Create a unique global instance if we need one.
+    make_global_instance(c, g);
+
+    // Generate all the methods.
+    if(!genfun_methods(c, g))
+    {
+      free_fields(g);
+      return false;
+    }
+
+    if(g->underlying != TK_STRUCT)
+      gendesc_init(c, g);
+
+    // Finish off the dispatch function.
+    if(g->underlying == TK_ACTOR)
+    {
+      codegen_startfun(c, g->dispatch_fn, false);
+      codegen_finishfun(c);
+    }
+
+    // Finish the dwarf frame.
+    dwarf_finish(&c->dwarf);
   }
-
-  gendesc_init(c, g);
-
-  // Finish off the dispatch function.
-  if(g->underlying == TK_ACTOR)
-  {
-    codegen_startfun(c, g->dispatch_fn, false);
-    codegen_finishfun(c);
-  }
-
-  // Finish the dwarf frame.
-  dwarf_finish(&c->dwarf);
 
   free_fields(g);
+  g->done = true;
   return true;
 }
 
